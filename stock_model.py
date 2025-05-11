@@ -79,10 +79,227 @@ def fetch_live_data(tickers, period="60d", interval="1h"):
     return all_data
 
 def calculate_indicators(data):
-    # ... keep the same calculate_indicators function from original code ...
+    if data.empty:
+        return data
+
+    # Initialize default values for all columns
+    indicator_columns = ['RSI', 'ATR', 'BB_upper', 'BB_middle', 'BB_lower',
+                        'MACD_Line', 'Signal_Line', 'MACD_Signal_Diff',
+                        'EMA7', 'EMA14', 'EMA200', 'EMA50_Diff', 'EMA14_Diff', 'EMA50',
+                        'EMA200_Diff', 'OBV', 'RSI_Signal_Diff', 'VWAP', 'EMA200_Angle']
+
+    for col in indicator_columns:
+        if col not in data.columns:
+            data[col] = 0.0
+
+    try:
+        # Calculate VWAP
+        data['VWAP'] = (data['Close'] * data['Volume']).cumsum() / data['Volume'].cumsum()
+
+        # RSI with None check
+        rsi = ta.rsi(data['Close'], length=14)
+        data['RSI'] = rsi.fillna(50) if rsi is not None else 50
+
+        # ATR with None check
+        atr = ta.atr(data['High'], data['Low'], data['Close'], length=14)
+        if atr is not None:
+            data['ATR'] = atr.fillna(data['Close'].diff().abs().mean())
+        else:
+            data['ATR'] = data['Close'].diff().abs().mean()
+
+        # Bollinger Bands with None check
+        bb = ta.bbands(data['Close'], length=20, std=2)
+        if bb is not None:
+            data['BB_upper'] = bb['BBU_20_2.0'].fillna(data['Close'].max())
+            data['BB_middle'] = bb['BBM_20_2.0'].fillna(data['Close'].mean())
+            data['BB_lower'] = bb['BBL_20_2.0'].fillna(data['Close'].min())
+
+        # ADX with None check
+        adx = ta.adx(data['High'], data['Low'], data['Close'], length=14)
+        if adx is not None:
+          data['ADX'] = adx['ADX_14'].fillna(0)  # Fill NaNs with 0
+        else:
+          data['ADX'] = 0
+
+                    # Calculate ADX slope (3-period)
+        data.index = pd.to_datetime(data['Date'])
+        data['ADX_Slope_Pct'] = data['ADX'].pct_change(3) * 100  # Slope as percentage
+        data['ADX_Rising'] = (data['ADX_Slope_Pct'] > 1.5).astype(int)  # Threshold = 1.5% rise
+
+               #MACD Calculation
+        if len(data) >= 42:  # Slow period determines the minimum data length required
+            macd = ta.macd(data['Close'], fast=12, slow=26, signal=9)
+            if macd is not None:
+                data['MACD_Line'] = macd[f'MACD_12_26_9'].fillna(0)
+                data['Signal_Line'] = macd[f'MACDs_12_26_9'].fillna(0)
+            else:
+                data['MACD_Line'] = 0
+                data['Signal_Line'] = 0
+        else:
+            data['MACD_Line'] = 0
+            data['Signal_Line'] = 0
+
+        # Convert 'Close' to numeric, coercing invalid values to NaN
+        data['Close'] = pd.to_numeric(data['Close'], errors='coerce')
+
+        # Calculate EMAs
+        for length in [14, 50, 200, 100]:
+            ema = ta.ema(data['Close'], length=length)
+            col_name = f'EMA{length}'
+            if length == 100:
+                # Keep NaNs for EMA100
+                data[col_name] = ema
+            else:
+                # Fill NaN with Close (now properly numeric)
+                data[col_name] = ema.fillna(data['Close'])
+
+        # Calculate differences (now safe with numeric types)
+        data['EMA50_Diff'] = data['EMA50'] - data['Close']
+        data['EMA14_Diff'] = data['EMA14'] - data['Close']
+        data['EMA200_Diff'] = data['EMA200'] - data['Close']
+
+        # OBV with None check
+        obv = ta.obv(data['Close'], data['Volume'])
+        data['OBV'] = obv.fillna(0) if obv is not None else 0
+
+        # MACD Signal Diff
+        data['MACD_Signal_Diff'] = data['MACD_Line'] - data['Signal_Line']
+
+        # RSI Signal Diff
+        data['RSI_Signal_Diff'] = data['RSI'] - data['Signal_Line']
+
+            # ADX with +DI/-DI (Fix existing implementation)
+        adx_full = ta.adx(data['High'], data['Low'], data['Close'], length=14)
+        if adx_full is not None:
+            data['ADX'] = adx_full['ADX_14'].fillna(0)
+            data['PlusDI'] = adx_full['DMP_14'].fillna(0)  # Correct column name
+            data['MinusDI'] = adx_full['DMN_14'].fillna(0)  # Correct column name
+        else:
+            data['ADX'] = 0
+            data['PlusDI'] = 0
+            data['MinusDI'] = 0
+
+        # -----------------------------------------------
+        # 1. ATR Percentile (10-day rolling)
+        data['ATR_Rank'] = data['ATR'].rolling(window=10).apply(
+            lambda x: x.rank(pct=True).iloc[-1], raw=False
+        ).fillna(0)
+
+        # 2. Volume Surge (1.5x 20-day MA)
+        data['Volume_MA20'] = data['Volume'].rolling(20).mean()
+        data['Volume_Surge'] = (data['Volume'] > (1.25 - 0.5 * data['ATR_Rank']) * data['Volume_MA20']).astype(int)
+
+        # 3. VWAP Slope (3-period)
+        data['VWAP_Slope'] = data['VWAP'].diff(3) > 0  # True if rising
+
+        # 4. MACD Histogram Momentum
+        if 'MACD_Line' in data and 'Signal_Line' in data:
+            data['MACD_Hist'] = data['MACD_Line'] - data['Signal_Line']
+            data['MACD_Hist_Rising'] = (data['MACD_Hist'].diff() > 0).astype(int)
+        else:
+            data['MACD_Hist'] = 0
+            data['MACD_Hist_Rising'] = 0
+
+        # EMA-200 Angle Calculation
+        if len(data) > 6 and 'EMA200' in data:
+            last_idx = -1
+            prev_idx = -6
+            y2 = data["EMA200"].iloc[last_idx]
+            y1 = data["EMA200"].iloc[prev_idx]
+            x2, x1 = last_idx, prev_idx
+            slope = (y2 - y1) / (x2 - x1) if (x2 - x1) != 0 else 0
+            angle = np.degrees(np.arctan(slope)) if slope != 0 else 0
+            data['EMA200_Angle'] = angle
+        else:
+            data['EMA200_Angle'] = 0
+
+    except Exception as e:
+        print(f"Error in indicator calculation: {str(e)[:50]}")
+
+    return data
 
 def display_sorted_metrics(data_dict):
-    # ... keep the same display_sorted_metrics function from original code ...
+    metrics = []
+    default_metric = {
+        "Ticker": "",
+        "Latest Price": 0.0,
+        "VWAP": 0.0,
+        "ATR": 0.0,
+        "ADX": 0.0,
+        "BB Status": "Unknown",
+        "OBV Trend": 0.0,
+        "MACD Signal Diff": 0.0,
+        "RSI": 50.0,
+        "RSI Signal Diff": 0.0,
+        "EMA 50 Diff": 0.0,
+        "EMA 14 Diff": 0.0,
+        "EMA 200 Diff": 0.0,
+        "Price-VWAP": 0.0,
+        "EMA200_Angle": 0.0,
+        "PlusDI_MinusDI": 0,
+        "ATR_Rank": 0.0,
+        "Volume_Surge": 0,
+        "VWAP_Slope": 0,
+        "MACD_Hist_Rising": 0,
+        "ADX_Slope (%)": 0,
+        "ADX_Rising": 0
+    }
+
+    for ticker, data in data_dict.items():
+        try:
+            if data.empty:
+                continue
+
+            latest = data.iloc[-1].to_dict()
+            ticker_name = ticker.replace(".NS", "")
+
+            # OBV Trend calculation
+            obv_trend = 0.0
+            if len(data) >= 2 and 'OBV' in data:
+                obv_trend = data['OBV'].iloc[-1] - data['OBV'].iloc[-2]
+
+            # Bollinger Band status
+            bb_status = "Within Bands"
+            if all(key in latest for key in ['BB_lower', 'BB_upper']):
+                close_price = latest.get('Close', 0)
+                bb_lower = latest.get('BB_lower', 0)
+                bb_upper = latest.get('BB_upper', 0)
+                if close_price < bb_lower:
+                    bb_status = "Below Lower"
+                elif close_price > bb_upper:
+                    bb_status = "Above Upper"
+
+            metric = default_metric.copy()
+            metric.update({
+                "Ticker": ticker_name,
+                "Latest Price": round(latest.get('Close', 0), 4),
+                "VWAP": round(latest.get('VWAP', 0), 4),
+                "ATR": round(latest.get('ATR', 0), 4),
+                "ADX": round(latest.get('ADX', 0), 4),
+                "BB Status": bb_status,
+                "OBV Trend": round(obv_trend, 4),
+                "MACD Signal Diff": round(latest.get('MACD_Signal_Diff', 0), 4),
+                "RSI": round(latest.get('RSI', 50), 4),
+                "RSI Signal Diff": round(latest.get('RSI_Signal_Diff', 0), 4),
+                "EMA 50 Diff": round(latest.get('EMA50_Diff', 0), 4),
+                "EMA 14 Diff": round(latest.get('EMA14_Diff', 0), 4),
+                "EMA 200 Diff": round(latest.get('EMA200_Diff', 0), 4),
+                "Price-VWAP": round(latest.get('Close', 0) - latest.get('VWAP', 0), 4),
+                "EMA200_Angle": round(latest.get('EMA200_Angle', 0), 4),
+                "PlusDI_MinusDI": round(latest.get('PlusDI', 0) - latest.get('MinusDI', 0), 4),
+                "ATR_Rank": round(latest.get('ATR_Rank', 0), 4),
+                "Volume_Surge": latest.get('Volume_Surge', 0),
+                "VWAP_Slope": latest.get('VWAP_Slope', 0),
+                "MACD_Hist_Rising": latest.get('MACD_Hist_Rising', 0),
+                "ADX_Slope (%)": round(latest.get('ADX_Slope_Pct', 0), 2),
+                "ADX_Rising": int(latest.get('ADX_Rising', 0))
+            })  # <-- This closes the update() call
+            metrics.append(metric)
+
+        except Exception as e:
+            print(f"Error processing {ticker}: {str(e)[:50]}")
+
+    return pd.DataFrame(metrics) if metrics else pd.DataFrame(columns=default_metric.keys())
 
 def main():
     st.set_page_config(
